@@ -1,0 +1,10 @@
+
+# Logs
+progress_log.txt
+inference_log.txt
+
+#executable
+
+main
+testBench
+testBench_3
