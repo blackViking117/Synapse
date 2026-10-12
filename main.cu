@@ -10,7 +10,22 @@ struct LetterboxInfo {
     float scale;
     int padX;
     int padY;
+    int newWidth;
+    int newHeight;
 };
+
+LetterboxInfo computeLetterboxInfo(int originalWidth, int originalHeight, int targetSize = 640) {
+    LetterboxInfo info;
+    info.scale = std::min(
+        static_cast<float>(targetSize) / originalWidth,
+        static_cast<float>(targetSize) / originalHeight
+    );
+    info.newWidth  = static_cast<int>(std::round(originalWidth * info.scale));
+    info.newHeight = static_cast<int>(std::round(originalHeight * info.scale));
+    info.padX = (targetSize - info.newWidth) / 2;
+    info.padY = (targetSize - info.newHeight) / 2;
+    return info;
+}
 
 #include <fstream>
 #include <filesystem>
@@ -72,27 +87,15 @@ class Logger : public ILogger
 } logger;
 
 
-std::vector<unsigned char> convertMatToHWC(const cv::Mat& input, LetterboxInfo& info) {
+std::vector<unsigned char> convertMatToHWC(const cv::Mat& input, const LetterboxInfo& info) {
     const int targetSize = 640;
 
-    int originalWidth  = input.cols;
-    int originalHeight = input.rows;
-
-    // Preserve aspect ratio
-    float scale = std::min(
-        static_cast<float>(targetSize) / originalWidth,
-        static_cast<float>(targetSize) / originalHeight
-    );
-
-    int newWidth  = static_cast<int>(std::round(originalWidth * scale));
-    int newHeight = static_cast<int>(std::round(originalHeight * scale));
-
-    // Resize
+    // Resize using precomputed dimensions
     cv::Mat resized;
     cv::resize(
         input,
         resized,
-        cv::Size(newWidth, newHeight)
+        cv::Size(info.newWidth, info.newHeight)
     );
 
     // Create padded image
@@ -103,15 +106,12 @@ std::vector<unsigned char> convertMatToHWC(const cv::Mat& input, LetterboxInfo& 
         cv::Scalar(114, 114, 114)
     );
 
-    int padX = (targetSize - newWidth) / 2;
-    int padY = (targetSize - newHeight) / 2;
-
     resized.copyTo(
         padded(cv::Rect(
-            padX,
-            padY,
-            newWidth,
-            newHeight
+            info.padX,
+            info.padY,
+            info.newWidth,
+            info.newHeight
         ))
     );
 
@@ -121,10 +121,6 @@ std::vector<unsigned char> convertMatToHWC(const cv::Mat& input, LetterboxInfo& 
         padded,
         cv::COLOR_BGR2RGB
     );
-
-    info.scale = scale;
-    info.padX = padX;
-    info.padY = padY;
 
 
     // Ensure the matrix is continuous in memory before copying
@@ -225,43 +221,46 @@ int main() {
     std::cout << std::endl;
     
     int numOfImgs = allImages.size();
+    if (numOfImgs == 0) {
+        std::cerr << "No images found!\n";
+        return -1;
+    }
+
+    // Precalculate LetterboxInfo ONCE from the first image (read-only for all threads)
+    cv::Mat firstImg = cv::imread(allImages[0]);
+    if (firstImg.empty()) {
+        std::cerr << "Failed to read first image for letterbox info!\n";
+        return -1;
+    }
+    const LetterboxInfo staticLetterboxInfo = computeLetterboxInfo(firstImg.cols, firstImg.rows, 640);
 
     for (int i = 0; i+3 < numOfImgs; i += 4) {
         if (counter % 4 == 0) {
             std::cout << "Iteration: " << counter << std::endl;
         }
         
-        auto item1 = allImages[i];
-        auto item2 = allImages[i + 1];
-        auto item3 = allImages[i + 2];
-        auto item4 = allImages[i + 3];
-        LetterboxInfo info;
-		cv::Mat image1 = cv::imread(item1);
-        cv::Mat image2 = cv::imread(item2);
-        cv::Mat image3 = cv::imread(item3);
-        cv::Mat image4 = cv::imread(item4);
-		
-		std::vector<unsigned char> inputHWC1 = convertMatToHWC(image1, info);
-        std::vector<unsigned char> inputHWC2 = convertMatToHWC(image2, info);
-        std::vector<unsigned char> inputHWC3 = convertMatToHWC(image3, info);
-        std::vector<unsigned char> inputHWC4 = convertMatToHWC(image4, info);
+        std::string items[4] = {allImages[i], allImages[i + 1], allImages[i + 2], allImages[i + 3]};
+        std::vector<unsigned char> inputHWCs[4];
 
-		cudaMemcpyAsync(d_hwc_1, inputHWC1.data(), inputHWC1.size(), cudaMemcpyHostToDevice, preProcessorStream1);
-		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream1>>>(d_hwc_1, (float*)input);
+        // 4 concurrent CPU threads for imread + convertMatToHWC (read-only access to staticLetterboxInfo)
+        std::thread workers[4];
+        for (int b = 0; b < 4; ++b) {
+            workers[b] = std::thread([b, &items, &inputHWCs, &staticLetterboxInfo]() {
+                cv::Mat img = cv::imread(items[b]);
+                inputHWCs[b] = convertMatToHWC(img, staticLetterboxInfo);
+            });
+        }
+        for (int b = 0; b < 4; ++b) {
+            workers[b].join();
+        }
 
-        cudaMemcpyAsync(d_hwc_2, inputHWC2.data(), inputHWC2.size(), cudaMemcpyHostToDevice, preProcessorStream2);
-		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream2>>>(d_hwc_2, ((float*)input + (3 * 640 * 640)));
+        // Single preprocessing stream sequentially queues H2D copies and kernels
+        for (int b = 0; b < 4; ++b) {
+            cudaMemcpyAsync(d_hwc, inputHWCs[b].data(), inputHWCs[b].size(), cudaMemcpyHostToDevice, preProcessorStream);
+            imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream>>>(d_hwc, (float*)input + (b * imageElements));
+        }
 
-        cudaMemcpyAsync(d_hwc_3, inputHWC3.data(), inputHWC3.size(), cudaMemcpyHostToDevice, preProcessorStream3);
-		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream3>>>(d_hwc_3, ((float*)input + (3 * 640 * 640 * 2)));
-
-        cudaMemcpyAsync(d_hwc_4, inputHWC4.data(), inputHWC4.size(), cudaMemcpyHostToDevice, preProcessorStream4);
-		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream4>>>(d_hwc_4, ((float*)input + (3 * 640 * 640 * 3)));
-
-        cudaStreamSynchronize(preProcessorStream1);
-        cudaStreamSynchronize(preProcessorStream2);
-        cudaStreamSynchronize(preProcessorStream3);
-        cudaStreamSynchronize(preProcessorStream4);
+        cudaStreamSynchronize(preProcessorStream);
 		
 		if (!context->enqueueV3(stream)) {
 			std::cout << "enqueueV3 Failed.....\n";
@@ -274,14 +273,8 @@ int main() {
 
     std::cout << "Last iteration: " << counter << std::endl;
 
-    cudaFree(d_hwc_1);
-    cudaFree(d_hwc_2);
-    cudaFree(d_hwc_3);
-    cudaFree(d_hwc_4);
-    cudaStreamDestroy(preProcessorStream1);
-    cudaStreamDestroy(preProcessorStream2);
-    cudaStreamDestroy(preProcessorStream3);
-    cudaStreamDestroy(preProcessorStream4);
+    cudaFree(d_hwc);
+    cudaStreamDestroy(preProcessorStream);
     cudaStreamDestroy(stream);
     cudaFreeHost(input);
     cudaFreeHost(output);
