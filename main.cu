@@ -154,14 +154,19 @@ int main() {
     // Ensure output directory exists
     std::filesystem::create_directories(outputPath);
 
-    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov8x_fp16.engine";
+    std::string engineFilePath = "/media/swdep/500GB_SSD_PERCEP/black_magic/yolov8x_b4.engine";
 
     std::ifstream engineFile(engineFilePath, std::ios::binary | std::ios::ate);
 	if (!engineFile) {
 		std::cout << "Couldn't Open the Engine File." << std::endl;
 		return -1;
 	}
-	
+
+
+	const int batchSize = 4;
+    const int imageElements = 3 * 640 * 640;
+
+
 	size_t engineSize = static_cast<size_t>(engineFile.tellg());
 	engineFile.seekg(0, std::ios::beg);
 
@@ -185,26 +190,23 @@ int main() {
 
     const char* inputName = engine->getIOTensorName(0);
     const char* outputName = engine->getIOTensorName(1);
-    context->setInputShape(inputName, Dims4{1, 3, 640, 640});
+    context->setInputShape(inputName, Dims4{batchSize, 3, 640, 640});
 
-    int ouputCount = 1;
     Dims const outputDims = context->getTensorShape(outputName);
-
-    size_t outputCount = 1;
-    for (int32_t i = 0; i < outputDims.nbDims; ++i) {
-            outputCount *= outputDims.d[i];
+    // For YOLOv8, outputDims is [batchSize, 84, 8400]
+    size_t outputPerImage = 1;
+    for (int32_t i = 1; i < outputDims.nbDims; ++i) { // start from dim 1 (skip batch)
+        outputPerImage *= outputDims.d[i];
     }
 
 
     void* input;
     void* output;
-    size_t inputSize = 1*3*640*640 * sizeof(float);
-    size_t outputSize = outputCount * sizeof(float);
+    size_t inputSize = batchSize * imageElements * sizeof(float);
+    size_t outputSize = batchSize * outputPerImage * sizeof(float);
 
     cudaHostAlloc(&input,  inputSize,  cudaHostAllocMapped);
     cudaHostAlloc(&output, outputSize, cudaHostAllocMapped);
-
-    std::vector<float> h_output(outputCount);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
@@ -217,18 +219,40 @@ int main() {
 
     int counter = 1;
     std::cout << std::endl;
-    for (std::string item : allImages) {
-        if (counter % 100 == 0) {
+    
+    int numOfImgs = allImages.size();
+
+    for (int i = 0; i+3 < numOfImgs; i += 4) {
+        if (counter % 4 == 0) {
             std::cout << "Iteration: " << counter++ << std::endl;
         }
         
-		cv::Mat image = cv::imread(item);
-		LetterboxInfo info;
-		std::string name = imagePath2Name(item);
+        auto item1 = allImages[i];
+        auto item2 = allImages[i + 1];
+        auto item3 = allImages[i + 2];
+        auto item4 = allImages[i + 3];
+        LetterboxInfo info;
+		cv::Mat image1 = cv::imread(item1);
+        cv::Mat image2 = cv::imread(item2);
+        cv::Mat image3 = cv::imread(item3);
+        cv::Mat image4 = cv::imread(item4);
 		
-		std::vector<unsigned char> inputHWC = convertMatToHWC(image, info);
-		cudaMemcpyAsync(d_hwc, inputHWC.data(), inputHWC.size(), cudaMemcpyHostToDevice, stream);
+		std::vector<unsigned char> inputHWC1 = convertMatToHWC(image1, info);
+        std::vector<unsigned char> inputHWC2 = convertMatToHWC(image2, info);
+        std::vector<unsigned char> inputHWC3 = convertMatToHWC(image3, info);
+        std::vector<unsigned char> inputHWC4 = convertMatToHWC(image4, info);
+
+		cudaMemcpyAsync(d_hwc, inputHWC1.data(), inputHWC1.size(), cudaMemcpyHostToDevice, stream);
 		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, (float*)input);
+
+        cudaMemcpyAsync(d_hwc, inputHWC2.data(), inputHWC2.size(), cudaMemcpyHostToDevice, stream);
+		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, ((float*)input + (3 * 640 * 640)));
+
+        cudaMemcpyAsync(d_hwc, inputHWC3.data(), inputHWC3.size(), cudaMemcpyHostToDevice, stream);
+		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, ((float*)input + (3 * 640 * 640 * 2)));
+
+        cudaMemcpyAsync(d_hwc, inputHWC4.data(), inputHWC4.size(), cudaMemcpyHostToDevice, stream);
+		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, ((float*)input + (3 * 640 * 640 * 3)));
 		
 		if (!context->enqueueV3(stream)) {
 			std::cout << "enqueueV3 Failed.....\n";
@@ -236,12 +260,10 @@ int main() {
 		}
 	
 		cudaStreamSynchronize(stream);
-		
-
-		cv::Mat outputImage = PostProcessor((float*)output, outputCount, image, info);
-		cv::imwrite(outputPath + '/' +  name + "_MP.jpg", outputImage);
         counter++;
 	}
+
+    std::cout << "Last iteration: " << counter << std::endl;
 
     cudaFree(d_hwc);
     cudaFreeHost(input);
