@@ -208,14 +208,23 @@ int main() {
     cudaHostAlloc(&input,  inputSize,  cudaHostAllocMapped);
     cudaHostAlloc(&output, outputSize, cudaHostAllocMapped);
 
+    cudaStream_t preProcessorStream1;
+    cudaStream_t preProcessorStream2;
+    cudaStreamCreate(&preProcessorStream1);
+    cudaStreamCreate(&preProcessorStream2);
+
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
     context->setTensorAddress(inputName, input);
     context->setTensorAddress(outputName, output);
     
-    uint8_t* d_hwc;
-    cudaMalloc(&d_hwc, 640 * 640 * 3 * sizeof(uint8_t));
+    uint8_t* d_hwc_1;
+    cudaMalloc(&d_hwc_1, 640 * 640 * 3 * sizeof(uint8_t));
+
+    uint8_t* d_hwc_2;
+    cudaMalloc(&d_hwc_2, 640 * 640 * 3 * sizeof(uint8_t));
+    
 
     int counter = 1;
     std::cout << std::endl;
@@ -224,7 +233,7 @@ int main() {
 
     for (int i = 0; i+3 < numOfImgs; i += 4) {
         if (counter % 4 == 0) {
-            std::cout << "Iteration: " << counter++ << std::endl;
+            std::cout << "Iteration: " << counter << std::endl;
         }
         
         auto item1 = allImages[i];
@@ -242,17 +251,20 @@ int main() {
         std::vector<unsigned char> inputHWC3 = convertMatToHWC(image3, info);
         std::vector<unsigned char> inputHWC4 = convertMatToHWC(image4, info);
 
-		cudaMemcpyAsync(d_hwc, inputHWC1.data(), inputHWC1.size(), cudaMemcpyHostToDevice, stream);
-		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, (float*)input);
+		cudaMemcpyAsync(d_hwc_1, inputHWC1.data(), inputHWC1.size(), cudaMemcpyHostToDevice, preProcessorStream1);
+		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream1>>>(d_hwc_1, (float*)input);
 
-        cudaMemcpyAsync(d_hwc, inputHWC2.data(), inputHWC2.size(), cudaMemcpyHostToDevice, stream);
-		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, ((float*)input + (3 * 640 * 640)));
+        cudaMemcpyAsync(d_hwc_1, inputHWC2.data(), inputHWC2.size(), cudaMemcpyHostToDevice, preProcessorStream1);
+		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream1>>>(d_hwc_1, ((float*)input + (3 * 640 * 640)));
 
-        cudaMemcpyAsync(d_hwc, inputHWC3.data(), inputHWC3.size(), cudaMemcpyHostToDevice, stream);
-		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, ((float*)input + (3 * 640 * 640 * 2)));
+        cudaMemcpyAsync(d_hwc_2, inputHWC3.data(), inputHWC3.size(), cudaMemcpyHostToDevice, preProcessorStream2);
+		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream2>>>(d_hwc_2, ((float*)input + (3 * 640 * 640 * 2)));
 
-        cudaMemcpyAsync(d_hwc, inputHWC4.data(), inputHWC4.size(), cudaMemcpyHostToDevice, stream);
-		imagePreprocessor_v4<<<25, 1024, 0, stream>>>(d_hwc, ((float*)input + (3 * 640 * 640 * 3)));
+        cudaMemcpyAsync(d_hwc_2, inputHWC4.data(), inputHWC4.size(), cudaMemcpyHostToDevice, preProcessorStream2);
+		imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream2>>>(d_hwc_2, ((float*)input + (3 * 640 * 640 * 3)));
+
+        cudaStreamSynchronize(preProcessorStream1);
+        cudaStreamSynchronize(preProcessorStream2);
 		
 		if (!context->enqueueV3(stream)) {
 			std::cout << "enqueueV3 Failed.....\n";
@@ -265,7 +277,11 @@ int main() {
 
     std::cout << "Last iteration: " << counter << std::endl;
 
-    cudaFree(d_hwc);
+    cudaFree(d_hwc_1);
+    cudaFree(d_hwc_2);
+    cudaStreamDestroy(preProcessorStream1);
+    cudaStreamDestroy(preProcessorStream2);
+    cudaStreamDestroy(stream);
     cudaFreeHost(input);
     cudaFreeHost(output);
 
