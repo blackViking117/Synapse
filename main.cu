@@ -197,34 +197,37 @@ int main() {
     }
 
 
-    void* input;
-    void* output;
+    void* input[2];
+    void* output[2];
     size_t inputSize = batchSize * imageElements * sizeof(float);
     size_t outputSize = batchSize * outputPerImage * sizeof(float);
 
-    cudaHostAlloc(&input,  inputSize,  cudaHostAllocMapped);
-    cudaHostAlloc(&output, outputSize, cudaHostAllocMapped);
+    cudaHostAlloc(&input[0],  inputSize,  cudaHostAllocMapped);
+    cudaHostAlloc(&output[0], outputSize, cudaHostAllocMapped);
+    cudaHostAlloc(&input[1],  inputSize,  cudaHostAllocMapped);
+    cudaHostAlloc(&output[1], outputSize, cudaHostAllocMapped);
 
-    cudaStream_t preProcessorStream;
-    cudaStreamCreate(&preProcessorStream);
+    cudaStream_t prepStream[2], inferStream[2];
+    for (int s = 0; s < 2; ++s) {
+        cudaStreamCreate(&prepStream[s]);
+        cudaStreamCreate(&inferStream[s]);
+    }
 
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    context->setTensorAddress(inputName, input);
-    context->setTensorAddress(outputName, output);
+    context->setTensorAddress(inputName, input[0]);
+    context->setTensorAddress(outputName, output[0]);
     
-    uint8_t* d_hwc;
-    cudaMalloc(&d_hwc, 640 * 640 * 3 * sizeof(uint8_t));
-
-    int counter = 1;
-    std::cout << std::endl;
+    uint8_t* d_hwc[2];
+    cudaMalloc(&d_hwc[0], 640 * 640 * 3 * sizeof(uint8_t));
+    cudaMalloc(&d_hwc[1], 640 * 640 * 3 * sizeof(uint8_t));
     
     int numOfImgs = allImages.size();
     if (numOfImgs == 0) {
         std::cerr << "No images found!\n";
         return -1;
     }
+
+    // 4 concurrent CPU threads for imread + convertMatToHWC (read-only access to staticLetterboxInfo)
+    std::thread workers[4];
 
     // Precalculate LetterboxInfo ONCE from the first image (read-only for all threads)
     cv::Mat firstImg = cv::imread(allImages[0]);
@@ -234,50 +237,85 @@ int main() {
     }
     const LetterboxInfo staticLetterboxInfo = computeLetterboxInfo(firstImg.cols, firstImg.rows, 640);
 
-    for (int i = 0; i+3 < numOfImgs; i += 4) {
-        if (counter % 4 == 0) {
-            std::cout << "Iteration: " << counter << std::endl;
-        }
-        
-        std::string items[4] = {allImages[i], allImages[i + 1], allImages[i + 2], allImages[i + 3]};
-        std::vector<unsigned char> inputHWCs[4];
+    int slot = 0;
+    
+    std::string items[4] = {allImages[0], allImages[1], allImages[2], allImages[3]};
+    std::vector<unsigned char> inputHWCs[4];
 
-        // 4 concurrent CPU threads for imread + convertMatToHWC (read-only access to staticLetterboxInfo)
-        std::thread workers[4];
+    for (int b = 0; b < 4; ++b) {
+        workers[b] = std::thread([b, &items, &inputHWCs, &staticLetterboxInfo]() {
+            cv::Mat img = cv::imread(items[b]);
+            inputHWCs[b] = convertMatToHWC(img, staticLetterboxInfo);
+        });
+    }
+    for (int b = 0; b < 4; ++b) {
+        workers[b].join();
+    }
+
+    // Single preprocessing stream sequentially queues H2D copies and kernels
+    for (int b = 0; b < 4; ++b) {
+        cudaMemcpyAsync(d_hwc[0], inputHWCs[b].data(), inputHWCs[b].size(), cudaMemcpyHostToDevice, prepStream[0]);
+        imagePreprocessor_v4<<<25, 1024, 0, prepStream[0]>>>(d_hwc[0], (float*)input[0] + (b * imageElements));
+    }
+
+    cudaStreamSynchronize(prepStream[0]);
+    
+    if (!context->enqueueV3(inferStream[0])) {
+        std::cout << "enqueueV3 Failed.....\n";
+        return -1;
+    }
+
+    for (int i = 4; i+3 < numOfImgs; i += 4) {
+
+        int curr = slot;
+        int next = 1 - slot;
+
+        std::string nextItems[4] = {allImages[i], allImages[i + 1], allImages[i + 2], allImages[i + 3]};
+
         for (int b = 0; b < 4; ++b) {
-            workers[b] = std::thread([b, &items, &inputHWCs, &staticLetterboxInfo]() {
-                cv::Mat img = cv::imread(items[b]);
+            workers[b] = std::thread([b, &nextItems, &inputHWCs, &staticLetterboxInfo]() {
+                cv::Mat img = cv::imread(nextItems[b]);
                 inputHWCs[b] = convertMatToHWC(img, staticLetterboxInfo);
             });
         }
+
+
         for (int b = 0; b < 4; ++b) {
             workers[b].join();
         }
 
-        // Single preprocessing stream sequentially queues H2D copies and kernels
+        // Preprocess next batch into `next` slot (while GPU runs `curr` slot)
         for (int b = 0; b < 4; ++b) {
-            cudaMemcpyAsync(d_hwc, inputHWCs[b].data(), inputHWCs[b].size(), cudaMemcpyHostToDevice, preProcessorStream);
-            imagePreprocessor_v4<<<25, 1024, 0, preProcessorStream>>>(d_hwc, (float*)input + (b * imageElements));
+            cudaMemcpyAsync(d_hwc[next], inputHWCs[b].data(), inputHWCs[b].size(), cudaMemcpyHostToDevice, prepStream[next]);
+            imagePreprocessor_v4<<<25, 1024, 0, prepStream[next]>>>(d_hwc[next], (float*)input[next] + (b * imageElements));
         }
 
-        cudaStreamSynchronize(preProcessorStream);
-		
-		if (!context->enqueueV3(stream)) {
-			std::cout << "enqueueV3 Failed.....\n";
-			return -1;
-		}
-	
-		cudaStreamSynchronize(stream);
-        counter++;
+        // Wait for: (1) preprocessing of next batch done, (2) inference of curr batch done
+        // BOTH must finish before we re-point context addresses and launch next inference
+        cudaStreamSynchronize(prepStream[next]);
+        cudaStreamSynchronize(inferStream[curr]);
+
+        context->setTensorAddress(inputName,  input[next]);
+        context->setTensorAddress(outputName, output[next]);
+
+        context->enqueueV3(inferStream[next]);  // GPU starts next batch
+        slot = next;
+
 	}
 
-    std::cout << "Last iteration: " << counter << std::endl;
+    cudaStreamSynchronize(inferStream[slot]);
 
-    cudaFree(d_hwc);
-    cudaStreamDestroy(preProcessorStream);
-    cudaStreamDestroy(stream);
-    cudaFreeHost(input);
-    cudaFreeHost(output);
+
+    cudaFree(d_hwc[0]);
+    cudaFree(d_hwc[1]);
+    cudaStreamDestroy(prepStream[0]);
+    cudaStreamDestroy(prepStream[1]);
+    cudaStreamDestroy(inferStream[0]);
+    cudaStreamDestroy(inferStream[1]);
+    cudaFreeHost(input[0]);
+    cudaFreeHost(input[1]);
+    cudaFreeHost(output[0]);
+    cudaFreeHost(output[1]);
 
 
     return 0;
